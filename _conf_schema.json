@@ -1,0 +1,17 @@
+{
+  "target_session": {
+    "type": "string",
+    "description": "只播报这个会话（做包含匹配），留空表示所有会话都播报",
+    "default": ""
+  },
+  "start_after": {
+    "type": "int",
+    "description": "任务耗时超过这个秒数才开始播报，避免短回复被刷屏",
+    "default": 30
+  },
+  "interval": {
+    "type": "int",
+    "description": "两条播报之间至少间隔多少秒",
+    "default": 30
+  }
+}
