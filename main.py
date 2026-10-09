@@ -35,6 +35,9 @@ DEFAULT_QUIET_MODE = False           # 安静模式：只报异常、卡住、�
 DEFAULT_PHASE_MIN_INTERVAL = 5       # 阶段切换判定阈值：距上次播报切换不足这么多秒则不重复报
 DEFAULT_STUCK_TIMEOUT = 120          # 超过这么多秒没有任何新事件就报一条疑似卡住
 DEFAULT_ENABLE_INTERVAL_REPORT = False  # 是否启用旧的按时间间隔刷进度（默认关闭）
+DEFAULT_RESULT_ANSWER_MIN_LEN = 80   # 答案短于这么多字符就不在汇总里附「答案：」一行
+DEFAULT_RESULT_MIN_STEPS = 3         # 收尾汇总门槛：步数达到这么多就发
+DEFAULT_RESULT_MIN_SECONDS = 30      # 收尾汇总门槛：耗时达到这么多秒就发
 
 # 事件类型 / 动作名 / 字段名，集中维护，降低上游日志结构变更的脆弱性
 EVENT_TYPE_TRACE = "trace"
@@ -181,11 +184,16 @@ def _looks_like_error(text: str) -> bool:
     return any(marker in low for marker in ERROR_MARKERS)
 
 
-def _answer_preview(fields: dict) -> str:
+def _answer_raw(fields: dict) -> str:
+    """取出答案原文（未截断），用于判断是否达到附摘要的长度门槛。"""
     resp = fields.get(FIELD_RESP)
     if not isinstance(resp, str):
         return ""
-    text = resp.strip()
+    return resp.strip()
+
+
+def _answer_preview(fields: dict) -> str:
+    text = _answer_raw(fields)
     if not text:
         return ""
     if len(text) > RESULT_PREVIEW_LEN:
@@ -209,11 +217,13 @@ def _token_total(fields: dict):
     return None
 
 
-def _result_summary(st: dict, fields: dict, now: float) -> str:
+def _result_summary(st: dict, fields: dict, now: float, answer_min_len: int) -> str:
     parts = [f"完成：一共 {st['steps']} 步，用时 {_fmt(now - st['start'])}"]
-    answer = _answer_preview(fields)
-    if answer:
-        parts.append(f"答案：{answer}")
+    # 答案过短就不附，避免和 AstrBot 真正发出的回复撞车
+    if len(_answer_raw(fields)) >= answer_min_len:
+        answer = _answer_preview(fields)
+        if answer:
+            parts.append(f"答案：{answer}")
     usage = _token_total(fields)
     if usage is not None:
         parts.append(f"Token 用量：{usage}")
@@ -301,6 +311,30 @@ class AgentProgress(Star):
     def watchdog_every(self):
         """卡住检测的轮询间隔，取超时值的四分之一，限制在 1~10 秒。"""
         return max(1, min(10, self.stuck_timeout // 4))
+
+    @property
+    def result_answer_min_len(self):
+        """答案短于这么多字符就不在汇总里附「答案：」一行。"""
+        try:
+            return max(0, int(self._get("result_answer_min_len", DEFAULT_RESULT_ANSWER_MIN_LEN)))
+        except Exception:
+            return DEFAULT_RESULT_ANSWER_MIN_LEN
+
+    @property
+    def result_min_steps(self):
+        """收尾汇总门槛：步数达到这么多就发。"""
+        try:
+            return max(0, int(self._get("result_min_steps", DEFAULT_RESULT_MIN_STEPS)))
+        except Exception:
+            return DEFAULT_RESULT_MIN_STEPS
+
+    @property
+    def result_min_seconds(self):
+        """收尾汇总门槛：耗时达到这么多秒就发。"""
+        try:
+            return max(0, int(self._get("result_min_seconds", DEFAULT_RESULT_MIN_SECONDS)))
+        except Exception:
+            return DEFAULT_RESULT_MIN_SECONDS
 
     # ---------------- 拿广播器 ----------------
     @staticmethod
@@ -414,8 +448,15 @@ class AgentProgress(Star):
         if action == ACTION_COMPLETE:
             self._spans.pop(span, None)
             if st["notified"] and self.show_result:
-                fields = entry.get(FIELD_FIELDS) or {}
-                await self._say(st["umo"], _result_summary(st, fields, now))
+                # 汇总门槛：步数或耗时任一达到各自阈值才发，两个都没到就静默收尾。
+                # 耗时用单调时钟（now 与 st["start"] 都来自 time.monotonic），不受墙钟跳变影响。
+                elapsed = now - st["start"]
+                if st["steps"] >= self.result_min_steps or elapsed >= self.result_min_seconds:
+                    fields = entry.get(FIELD_FIELDS) or {}
+                    await self._say(
+                        st["umo"],
+                        _result_summary(st, fields, now, self.result_answer_min_len),
+                    )
 
     def _new_span(self, umo: str, now: float) -> dict:
         return {

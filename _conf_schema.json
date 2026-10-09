@@ -38,5 +38,20 @@
     "type": "bool",
     "description": "是否启用旧的按时间间隔刷进度（默认关闭，交由阶段/异常/卡住/结束播报）",
     "default": false
+  },
+  "result_answer_min_len": {
+    "type": "int",
+    "description": "答案短于这么多字符时，收尾汇总里不附「答案：」一行，避免与真实回复重复",
+    "default": 80
+  },
+  "result_min_steps": {
+    "type": "int",
+    "description": "收尾汇总门槛：任务步数达到这么多就发汇总",
+    "default": 3
+  },
+  "result_min_seconds": {
+    "type": "int",
+    "description": "收尾汇总门槛：任务耗时达到这么多秒就发汇总",
+    "default": 30
   }
 }
