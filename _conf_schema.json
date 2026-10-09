@@ -18,5 +18,25 @@
     "type": "bool",
     "description": "任务收尾时是否补一条汇总（尽量附上答案摘要与 Token 用量）",
     "default": true
+  },
+  "quiet_mode": {
+    "type": "bool",
+    "description": "安静模式：只报异常、卡住和结束，不报阶段切换",
+    "default": false
+  },
+  "phase_min_interval": {
+    "type": "int",
+    "description": "阶段切换判定阈值：距上次播报切换不足这么多秒则不重复报",
+    "default": 5
+  },
+  "stuck_timeout": {
+    "type": "int",
+    "description": "超过这么多秒没有任何新事件就报一条疑似卡住",
+    "default": 120
+  },
+  "enable_interval_report": {
+    "type": "bool",
+    "description": "是否启用旧的按时间间隔刷进度（默认关闭，交由阶段/异常/卡住/结束播报）",
+    "default": false
   }
 }
