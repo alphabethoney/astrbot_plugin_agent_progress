@@ -1,7 +1,7 @@
 {
   "target_session": {
     "type": "string",
-    "description": "只播报这个会话（做包含匹配），留空表示所有会话都播报",
+    "description": "只播报这个会话（做精确匹配），留空表示所有会话都播报",
     "default": ""
   },
   "start_after": {
@@ -13,5 +13,10 @@
     "type": "int",
     "description": "两条播报之间至少间隔多少秒",
     "default": 30
+  },
+  "show_result": {
+    "type": "bool",
+    "description": "任务收尾时是否补一条汇总（尽量附上答案摘要与 Token 用量）",
+    "default": true
   }
 }

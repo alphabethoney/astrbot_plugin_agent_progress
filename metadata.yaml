@@ -3,6 +3,6 @@ display_name: agent进度播报
 desc: 订阅 AstrBot 内部 trace 事件，把 agent 干活的关键节点发到聊天，不经过大模型，零 token 成本
 version: v1.0.0
 author: alphabethoney
-repo: https://github.com/alphabethoney/astrbot_plugin_agent_progress
+repo: ""
 support_platforms:
   - aiocqhttp

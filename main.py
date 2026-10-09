@@ -13,7 +13,6 @@
 依赖：把 trace_enable 打开（面板或接口均可），否则收不到事件。
 """
 import asyncio
-import os
 import time
 
 from astrbot.api import logger
@@ -25,6 +24,28 @@ DEFAULT_SESSION = ""            # 形如 "aiocqhttp:FriendMessage:1234567890"，
 DEFAULT_START_AFTER = 30        # 任务跑过这么多秒才开始播报
 DEFAULT_INTERVAL = 30           # 两条播报之间至少间隔这么多秒
 DEFAULT_SHOW_RESULT = True      # 是否在收尾时补一条汇总
+
+# 事件类型 / 动作名 / 字段名，集中维护，降低上游日志结构变更的脆弱性
+EVENT_TYPE_TRACE = "trace"
+ACTION_PREPARE = "astr_agent_prepare"
+ACTION_TOOL_CALL = "agent_tool_call"
+ACTION_COMPLETE = "astr_agent_complete"
+FIELD_TYPE = "type"
+FIELD_UMO = "umo"
+FIELD_ACTION = "action"
+FIELD_SPAN_ID = "span_id"
+FIELD_FIELDS = "fields"
+FIELD_TOOL_NAME = "tool_name"
+FIELD_RESP = "resp"
+FIELD_STATS = "stats"
+FIELD_TOKEN_USAGE = "token_usage"
+FIELD_TOTAL = "total"
+
+# 完成通知里答案摘要最多贴多少字符
+RESULT_PREVIEW_LEN = 120
+
+# span 超过这么久没有任何动静就淘汰，避免 _spans 无界增长
+SPAN_TTL = 1800
 
 # 工具名翻译，看着顺眼些
 TOOL_CN = {
@@ -51,10 +72,50 @@ def _fmt(seconds: float) -> str:
     return f"{seconds // 60} 分 {seconds % 60} 秒"
 
 
+def _answer_preview(fields: dict) -> str:
+    resp = fields.get(FIELD_RESP)
+    if not isinstance(resp, str):
+        return ""
+    text = resp.strip()
+    if not text:
+        return ""
+    if len(text) > RESULT_PREVIEW_LEN:
+        return text[:RESULT_PREVIEW_LEN] + "…"
+    return text
+
+
+def _token_total(fields: dict):
+    stats = fields.get(FIELD_STATS)
+    if not isinstance(stats, dict):
+        return None
+    usage = stats.get(FIELD_TOKEN_USAGE)
+    if isinstance(usage, dict):
+        total = usage.get(FIELD_TOTAL)
+    else:
+        total = getattr(usage, FIELD_TOTAL, None)
+    if isinstance(total, bool):
+        return None
+    if isinstance(total, (int, float)):
+        return int(total)
+    return None
+
+
+def _result_summary(st: dict, fields: dict, now: float) -> str:
+    parts = [f"完成：一共 {st['steps']} 步，用时 {_fmt(now - st['start'])}"]
+    answer = _answer_preview(fields)
+    if answer:
+        parts.append(f"答案：{answer}")
+    usage = _token_total(fields)
+    if usage is not None:
+        parts.append(f"Token 用量：{usage}")
+    return "\n".join(parts)
+
+
 class AgentProgress(Star):
     def __init__(self, context: Context, config=None):
         super().__init__(context)
         self._cfg = config
+        self._broker = None
         self._queue = None
         self._task = None
         self._spans = {}   # span_id -> 统计信息
@@ -87,6 +148,13 @@ class AgentProgress(Star):
         except Exception:
             return DEFAULT_INTERVAL
 
+    @property
+    def show_result(self):
+        try:
+            return bool(self._get("show_result", DEFAULT_SHOW_RESULT))
+        except Exception:
+            return DEFAULT_SHOW_RESULT
+
     # ---------------- 拿广播器 ----------------
     @staticmethod
     def _find_broker():
@@ -106,23 +174,26 @@ class AgentProgress(Star):
 
     # ---------------- 生命周期 ----------------
     async def initialize(self):
-        broker = self._find_broker()
-        if broker is None:
+        self._broker = self._find_broker()
+        if self._broker is None:
             logger.warning("[进度播报] 没找到广播器，插件不会工作")
             return
-        self._queue = broker.register()
+        self._queue = self._broker.register()
         self._task = asyncio.create_task(self._loop())
         logger.info("[进度播报] 已启动，开始订阅 trace 事件")
 
     async def terminate(self):
         if self._task:
             self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
             self._task = None
         if self._queue is not None:
-            broker = self._find_broker()
-            if broker is not None:
+            if self._broker is not None:
                 try:
-                    broker.unregister(self._queue)
+                    self._broker.unregister(self._queue)
                 except Exception:
                     pass
             self._queue = None
@@ -132,69 +203,80 @@ class AgentProgress(Star):
         while True:
             entry = await self._queue.get()
             try:
-                if not isinstance(entry, dict) or entry.get("type") != "trace":
+                if not isinstance(entry, dict) or entry.get(FIELD_TYPE) != EVENT_TYPE_TRACE:
                     continue
                 await self._handle(entry)
             except Exception:
                 logger.warning("[进度播报] 处理事件出错", exc_info=True)
 
     async def _handle(self, entry: dict):
-        umo = str(entry.get("umo") or "")
-        if self.session_filter and self.session_filter not in umo:
+        now = time.monotonic()
+        self._sweep(now)
+        umo = str(entry.get(FIELD_UMO) or "")
+        if self.session_filter and self.session_filter != umo:
             return
-
-        action = entry.get("action") or ""
-        span = entry.get("span_id") or ""
-        now = time.time()
-
-        if action == "astr_agent_prepare":
-            self._spans[span] = {
-                "umo": umo,
-                "start": now,
-                "steps": 0,
-                "last_sent": 0.0,
-                "notified": False,
-                "last_tool": "",
-            }
+        action = entry.get(FIELD_ACTION) or ""
+        span = entry.get(FIELD_SPAN_ID) or ""
+        if not span:
             return
-
+        if action == ACTION_PREPARE:
+            self._spans[span] = self._new_span(umo, now)
+            return
         st = self._spans.get(span)
         if st is None:
             return
-
-        if action == "agent_tool_call":
-            st["steps"] += 1
-            fields = entry.get("fields") or {}
-            raw = str(fields.get("tool_name") or "")
-            st["last_tool"] = TOOL_CN.get(raw, raw)
-            elapsed = now - st["start"]
-            if elapsed < self.start_after:
-                return
-            if now - st["last_sent"] < self.interval:
-                return
-            st["last_sent"] = now
-            st["notified"] = True
-            await self._say(
-                umo,
-                f"进度：已执行 {st['steps']} 步，当前在做「{st['last_tool']}」，"
-                f"累计 {_fmt(elapsed)}",
-            )
+        st["last_seen"] = now
+        if action == ACTION_TOOL_CALL:
+            await self._report_tool(st, entry, umo, now)
             return
-
-        if action == "astr_agent_complete":
+        if action == ACTION_COMPLETE:
             self._spans.pop(span, None)
-            if not st["notified"]:
-                return
-            await self._say(
-                umo, f"完成：一共 {st['steps']} 步，用时 {_fmt(now - st['start'])}"
-            )
+            if st["notified"] and self.show_result:
+                fields = entry.get(FIELD_FIELDS) or {}
+                await self._say(st["umo"], _result_summary(st, fields, now))
+
+    def _new_span(self, umo: str, now: float) -> dict:
+        return {
+            "umo": umo,
+            "start": now,
+            "steps": 0,
+            "last_sent": 0.0,
+            "notified": False,
+            "last_tool": "",
+            "last_seen": now,
+        }
+
+    async def _report_tool(self, st: dict, entry: dict, umo: str, now: float):
+        st["steps"] += 1
+        fields = entry.get(FIELD_FIELDS) or {}
+        raw = str(fields.get(FIELD_TOOL_NAME) or "")
+        st["last_tool"] = TOOL_CN.get(raw, raw)
+        elapsed = now - st["start"]
+        if elapsed < self.start_after:
+            return
+        if now - st["last_sent"] < self.interval:
+            return
+        st["last_sent"] = now
+        st["notified"] = True
+        await self._say(
+            umo,
+            f"进度：已执行 {st['steps']} 步，当前在做「{st['last_tool']}」，"
+            f"累计 {_fmt(elapsed)}",
+        )
+
+    def _sweep(self, now: float):
+        stale = [s for s, st in self._spans.items() if now - st["last_seen"] > SPAN_TTL]
+        for span in stale:
+            self._spans.pop(span, None)
 
     async def _say(self, umo: str, text: str):
         """回发到触发这条任务的那个会话本身。"""
         if not umo:
-            logger.info("[进度播报] 事件里没有会话信息，内容：%s", text)
+            logger.info("[进度播报] 事件里没有会话信息，未播报（内容 %d 字）", len(text))
             return
         try:
             await self.context.send_message(umo, MessageChain().message(text))
         except Exception:
-            logger.warning("[进度播报] 发送失败（目标 %s）: %s", umo, text, exc_info=True)
+            logger.warning(
+                "[进度播报] 发送失败（目标 %s，内容 %d 字）", umo, len(text), exc_info=True
+            )
